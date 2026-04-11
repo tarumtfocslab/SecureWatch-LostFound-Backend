@@ -8516,4 +8516,3 @@ def set_live_active_sequence(payload: dict = Body(...)):
         "mode": mode,
         "active_cam_ids": cleaned
     }
-
