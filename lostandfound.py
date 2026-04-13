@@ -27,7 +27,7 @@ import warnings
 from pathlib import Path
 
 CURRENT_FILE = Path(__file__).resolve()
-LOSTFOUND_BACKEND_DIR = CURRENT_FILE.parents[1] 
+LOSTFOUND_BACKEND_DIR = CURRENT_FILE.parents[0] 
 
 # ---------------------------------------------------------
 #  SET YOUR VIDEO PATH HERE

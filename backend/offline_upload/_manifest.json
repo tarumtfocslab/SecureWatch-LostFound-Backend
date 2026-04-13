@@ -19,7 +19,7 @@
       "h264_name": "B100D_B_Block_B_Block_20251110081000_20251110084058_39454624_h264.mp4",
       "h264_ready": true,
       "roi_ready": true,
-      "status": "ready",
+      "status": "analyzing",
       "error": null,
       "duration": "00:30:57"
     },
@@ -52,7 +52,7 @@
       "h264_name": "B100D_B_Block_B_Block_20251110101000_20251110104057_40572930_h264.mp4",
       "h264_ready": true,
       "roi_ready": true,
-      "status": "ready",
+      "status": "analyzing",
       "error": null,
       "duration": "00:30:57"
     }
