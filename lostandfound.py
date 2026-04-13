@@ -4039,10 +4039,20 @@ class LostAndFoundManager:
         }
 
     def _snapshot_signature_group(self, item) -> tuple:
+        """
+        Group only truly comparable lost items together.
+
+        Compare only within same:
+        - class
+        - view
+        - roi
+        - owner
+        """
         return (
-            str(item.class_name or "").strip().lower(),
-            str(item.view_name or "").strip().lower(),
-            str(item.roi_id or "").strip().lower(),
+            str(getattr(item, "class_name", "") or "").strip().lower(),
+            str(getattr(item, "view_name", "") or "").strip().lower(),
+            str(getattr(item, "roi_id", "") or "").strip().lower(),
+            str(getattr(item, "owner_person_id", None) or "no_owner").strip().lower(),
         )
 
     def _load_gray_for_hash(self, path: str):
@@ -4107,6 +4117,16 @@ class LostAndFoundManager:
             return -1e9
         
     def _dedupe_snapshots_periodic(self, now_ts: float, force: bool = False):
+        """
+        Snapshot dedupe:
+        - compare only same class/view/roi/owner
+        - compare only within time window
+        - keep better image
+        - delete duplicate physical image files
+        - DO NOT merge different lost records into same image_path
+        - DO NOT set image_path to None
+        - record stays, only duplicate file is removed
+        """
         if not self.snapshot_dedupe_enabled:
             return False
 
@@ -4119,7 +4139,6 @@ class LostAndFoundManager:
         with self._lock:
             items = list(self.lost_items.values())
 
-            # group by same class/view/roi
             groups = defaultdict(list)
             for it in items:
                 if not it or not getattr(it, "image_path", None):
@@ -4132,24 +4151,31 @@ class LostAndFoundManager:
                 if len(group_items) < 2:
                     continue
 
-                # sort by lost time
-                group_items.sort(key=lambda x: float(x.lost_time or 0.0))
-
+                group_items.sort(key=lambda x: float(getattr(x, "lost_time", 0.0) or 0.0))
                 keepers = []
 
                 for cur in group_items:
-                    cur_path = str(cur.image_path or "")
+                    cur_path = str(getattr(cur, "image_path", "") or "")
                     if not cur_path:
+                        continue
+                    if not os.path.exists(cur_path):
                         continue
 
                     matched_keeper = None
 
                     for kept in keepers:
-                        # only compare near timestamps
-                        if abs(float(cur.lost_time or 0.0) - float(kept.lost_time or 0.0)) > self.snapshot_time_window_sec:
+                        kept_path = str(getattr(kept, "image_path", "") or "")
+                        if not kept_path or not os.path.exists(kept_path):
                             continue
 
-                        sim = self._hash_similarity(cur_path, str(kept.image_path or ""))
+                        # only compare near timestamps
+                        if abs(
+                            float(getattr(cur, "lost_time", 0.0) or 0.0)
+                            - float(getattr(kept, "lost_time", 0.0) or 0.0)
+                        ) > self.snapshot_time_window_sec:
+                            continue
+
+                        sim = self._hash_similarity(cur_path, kept_path)
                         if sim >= self.snapshot_similarity_threshold:
                             matched_keeper = kept
                             break
@@ -4158,34 +4184,85 @@ class LostAndFoundManager:
                         keepers.append(cur)
                         continue
 
-                    # choose better image
                     cur_score = self._snapshot_quality_score(cur_path)
-                    keep_score = self._snapshot_quality_score(str(matched_keeper.image_path or ""))
+                    keep_path = str(getattr(matched_keeper, "image_path", "") or "")
+                    keep_score = self._snapshot_quality_score(keep_path)
 
                     if cur_score > keep_score:
-                        old_keep_path = str(matched_keeper.image_path or "")
-                        matched_keeper.image_path = cur_path
-                        cur.image_path = cur_path
+                        old_keep_path = keep_path
 
-                        # redirect old matched item path to better one
+                        # keeper switches to better physical image
+                        matched_keeper.image_path = cur_path
+
+                        # delete old keeper physical file
                         if old_keep_path and old_keep_path != cur_path and os.path.exists(old_keep_path):
                             try:
                                 os.remove(old_keep_path)
                             except Exception:
                                 pass
+
+                        # IMPORTANT:
+                        # do NOT modify cur.image_path
+                        # keep current record untouched
+
                     else:
-                        # redirect current lost item to keeper image
-                        cur.image_path = str(matched_keeper.image_path or "")
-                        if cur_path != cur.image_path and os.path.exists(cur_path):
+                        # current file is worse duplicate -> delete only physical file
+                        if cur_path != keep_path and os.path.exists(cur_path):
                             try:
                                 os.remove(cur_path)
                             except Exception:
                                 pass
 
+                        # IMPORTANT:
+                        # do NOT set cur.image_path = None
+                        # do NOT redirect cur.image_path to keeper image
+                        # keep record untouched
+
                     changed = True
 
         return changed
-    
+    def _dedup_lost_items(self, items: list) -> list:
+        """
+        Deduplicate lost items ONLY by lost_id.
+
+        IMPORTANT:
+        - Do NOT dedupe by class_name / roi_id / image_path
+        - Different records may legitimately share similar image content
+        - We want to preserve event records even if snapshot images are similar
+        """
+        by_id = {}
+
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+
+            lid = str(it.get("lost_id") or "").strip()
+            if not lid:
+                continue
+
+            prev = by_id.get(lid)
+            if prev is None:
+                by_id[lid] = it
+                continue
+
+            # keep earlier lost_time if duplicate lost_id appears
+            try:
+                cur_ts = float(it.get("lost_time", 1e18) or 1e18)
+            except Exception:
+                cur_ts = 1e18
+
+            try:
+                prev_ts = float(prev.get("lost_time", 1e18) or 1e18)
+            except Exception:
+                prev_ts = 1e18
+
+            if cur_ts < prev_ts:
+                by_id[lid] = it
+
+        out = list(by_id.values())
+        out.sort(key=lambda x: float(x.get("lost_time", 0.0) or 0.0))
+        return out
+
     def set_lost_item_status(self, lost_id: str, new_status: str):
         with self._lock:
             if lost_id in self.lost_items:
@@ -4566,30 +4643,6 @@ class LostAndFoundManager:
             if DEBUG_LOST_FOUND:
                 print(f"[P6] view={view_name} items_states={len(self.states)} lost_items={len(self.lost_items)}")
     
-    def _dedup_lost_items(self, items: list) -> list:
-        # 1) dedup by lost_id first
-        by_id = {}
-        for it in items:
-            lid = it.get("lost_id")
-            if not lid:
-                continue
-            prev = by_id.get(lid)
-            if prev is None or float(it.get("lost_time", 1e18)) < float(prev.get("lost_time", 1e18)):
-                by_id[lid] = it
-        items = list(by_id.values())
-
-        # 2) optional: dedup same ROI+class+image
-        best = {}
-        for it in items:
-            sig = (it.get("class_name", ""), it.get("roi_id", ""), it.get("image_path", ""))
-            prev = best.get(sig)
-            if prev is None or float(it.get("lost_time", 1e18)) < float(prev.get("lost_time", 1e18)):
-                best[sig] = it
-
-        out = list(best.values())
-        out.sort(key=lambda x: float(x.get("lost_time", 0.0)))
-        return out
-
     def export_lost_items_json(self, out_path: str):
         with self._lock:
             data = [asdict(v) for v in self.lost_items.values()]

@@ -1997,8 +1997,8 @@ def restart_single_live_camera(cam_id: str) -> bool:
                 num_workers=1,
                 max_skip=0,
 
-                desired_fps_fisheye=1.5,
-                desired_fps_normal=3.0,
+                desired_fps_fisheye=6.0,
+                desired_fps_normal=10.0,
                 window_scale=0.80,
                 display_fps=8.0,
 
@@ -2276,8 +2276,8 @@ def start_live_pipelines(limit_normal: int = 999, limit_fisheye: int = 999):
                 num_workers=1,
                 max_skip=0,
 
-                desired_fps_fisheye=1.5,
-                desired_fps_normal=3.0,
+                desired_fps_fisheye=6.0,
+                desired_fps_normal=10.0,
                 window_scale=0.80,
                 display_fps=8.0,
 
@@ -4736,6 +4736,27 @@ def _pick_status(obj: dict) -> str:
         return "solved"
     return "lost"
 
+def _resolve_item_location(source_id: str) -> str:
+    source_id = str(source_id or "").strip()
+    if not source_id:
+        return "Unknown"
+
+    if source_id.startswith("rtsp_"):
+        try:
+            rtsp = load_rtsp_sources() or {}
+        except Exception:
+            rtsp = {}
+
+        rec = rtsp.get(source_id)
+        if isinstance(rec, dict):
+            name = str(rec.get("name") or "").strip()
+            if name:
+                return name
+
+        return source_id
+
+    return extract_location_from_stem(source_id)
+
 def _normalize_live_item(cam_id: str, it: dict, request_base: str) -> dict:
     it = it or {}
     raw = it.get("raw") if isinstance(it.get("raw"), dict) else it
@@ -4783,23 +4804,18 @@ def _normalize_live_item(cam_id: str, it: dict, request_base: str) -> dict:
     except Exception:
         duration_before_lost = 0.0
 
-    # lastSeenTs = lost event time if available
-    if lost_time is not None:
-        last_seen_ts = int(lost_time)
-    else:
-        ts_guess = _ts_from_snapshot_name(snap_str) if snap_str else 0
-        try:
-            last_seen_ts = int(ts_guess) if int(ts_guess) > 0 else int(time.time())
-        except Exception:
-            last_seen_ts = int(time.time())
+    snap_ts = _ts_from_snapshot_name(snap_str) if snap_str else 0
+    now_ts = int(time.time())
 
-    # IMPORTANT:
-    # firstSeenTs should follow backend original logic:
-    # duration_before_lost = lost_time - first_seen_time
+    # real wall-clock event time
+    if snap_ts > 0:
+        last_seen_ts = int(snap_ts)
+    else:
+        last_seen_ts = now_ts
+
     duration_sec = max(0.0, duration_before_lost)
     first_seen_ts = int(last_seen_ts - duration_sec) if duration_sec > 0 else last_seen_ts
 
-    # safety
     if first_seen_ts < 0 or first_seen_ts > last_seen_ts:
         first_seen_ts = last_seen_ts
 
@@ -4861,21 +4877,20 @@ def _normalize_offline_item(stem: str, it: dict, request_base: str) -> dict:
     except Exception:
         duration_before_lost = 0.0
 
-    # lastSeenTs = lost event time if available
-    if lost_time is not None:
-        last_seen_ts = int(lost_time)
-    else:
-        ts_guess = _ts_from_snapshot_name(snap_str) if snap_str else 0
-        try:
-            last_seen_ts = int(ts_guess) if int(ts_guess) > 0 else int(time.time())
-        except Exception:
-            last_seen_ts = int(time.time())
+    snap_ts = _ts_from_snapshot_name(snap_str) if snap_str else 0
+    now_ts = int(time.time())
 
-    # IMPORTANT:
-    # firstSeenTs should follow backend original logic:
-    # duration_before_lost = lost_time - first_seen_time
+    # real wall-clock event time
+    if snap_ts > 0:
+        last_seen_ts = int(snap_ts)
+    else:
+        last_seen_ts = now_ts
+
     duration_sec = max(0.0, duration_before_lost)
     first_seen_ts = int(last_seen_ts - duration_sec) if duration_sec > 0 else last_seen_ts
+
+    if first_seen_ts < 0 or first_seen_ts > last_seen_ts:
+        first_seen_ts = last_seen_ts
 
     # safety
     if first_seen_ts < 0 or first_seen_ts > last_seen_ts:
@@ -4901,7 +4916,6 @@ def _read_json_file(p: Path) -> dict:
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return {}
-
 
 SNAPSHOT_DIR = PROJECT_ROOT / "snapshots"  # same as video_pipeline.py default
 SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -5125,17 +5139,14 @@ def _maybe_emit_lf_notification(item: Dict[str, Any], request_base: str) -> None
         "imageUrl": image_url,
     }
     _lf_broadcast_notification(payload)
+
+
     
 @app.get("/api/lostfound/items")
 def api_lostfound_items(request: Request):
     base = str(request.base_url).rstrip("/")
 
     overrides = _read_overrides()
-
-    # persistent history store
-    store = _read_items_store()
-    if not isinstance(store, dict):
-        store = {}
 
     def _is_deleted_item(item_id: str) -> bool:
         ov = overrides.get(str(item_id or "").strip()) or {}
@@ -5149,13 +5160,15 @@ def api_lostfound_items(request: Request):
         if not isinstance(item, dict):
             return
 
+        store = _read_items_store()
+        if not isinstance(store, dict):
+            store = {}
+
         iid = str(item.get("id") or "").strip()
         if not iid:
             return
 
-        # IMPORTANT:
-        # do not re-merge deleted items into event history,
-        # but also do not remove existing history from store
+        # do not re-merge deleted items into event history
         if _is_deleted_item(iid):
             return
 
@@ -5173,8 +5186,18 @@ def api_lostfound_items(request: Request):
             except Exception:
                 merged["firstSeenTs"] = prev_first
 
+        # keep latest lastSeenTs
+        prev_last = merged.get("lastSeenTs")
+        new_last = item.get("lastSeenTs")
+        if prev_last is None and new_last is not None:
+            merged["lastSeenTs"] = new_last
+        elif prev_last is not None and new_last is not None:
+            try:
+                merged["lastSeenTs"] = max(float(prev_last), float(new_last))
+            except Exception:
+                merged["lastSeenTs"] = new_last
+
         for k in (
-            "lastSeenTs",
             "module",
             "source",
             "cameraId",
@@ -5193,13 +5216,64 @@ def api_lostfound_items(request: Request):
             if k in item and item[k] is not None:
                 merged[k] = item[k]
 
+        src_id = str(merged.get("cameraId") or merged.get("videoId") or "").strip()
+        source = str(merged.get("source") or "").strip().lower()
+
+        if src_id:
+            resolved_name = _resolve_item_location(src_id)
+            merged["location"] = resolved_name
+
+            old_id = str(iid).strip()
+            safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", str(resolved_name or "")).strip("_")
+
+            new_id = old_id
+
+            if safe_name:
+                if source == "live":
+                    # current normalize format:
+                    # live-{cam_id}_{safe_name}_{raw_id}
+                    wanted_prefix = f"live-{src_id}_{safe_name}_"
+
+                    if not old_id.startswith(wanted_prefix):
+                        if old_id.startswith(f"live-{src_id}_"):
+                            rest = old_id[len(f"live-{src_id}_"):]
+                            if not rest.startswith(f"{safe_name}_"):
+                                new_id = wanted_prefix + rest
+                        elif old_id.startswith(f"live-{src_id}-"):
+                            rest = old_id[len(f"live-{src_id}-"):]
+                            new_id = wanted_prefix + rest
+
+                elif source in ("upload", "offline"):
+                    # current normalize format:
+                    # offline-{stem}_{safe_name}_{lost_id}
+                    wanted_prefix = f"offline-{src_id}_{safe_name}_"
+
+                    if not old_id.startswith(wanted_prefix):
+                        if old_id.startswith(f"offline-{src_id}_"):
+                            rest = old_id[len(f"offline-{src_id}_"):]
+                            if not rest.startswith(f"{safe_name}_"):
+                                new_id = wanted_prefix + rest
+                        elif old_id.startswith(f"offline-{src_id}-"):
+                            rest = old_id[len(f"offline-{src_id}-"):]
+                            new_id = wanted_prefix + rest
+
+            if new_id != old_id:
+                merged["id"] = new_id
+                store.pop(old_id, None)
+                iid = new_id
+            else:
+                merged["id"] = old_id
+        else:
+            merged["id"] = iid
+
         store[iid] = merged
+        _write_items_store(store)
 
     # -------------------------
     # 1) LIVE items from running pipelines
     # -------------------------
     try:
-        for cam_id, p in list(pipelines.items()):
+        for cam_id, p in list(pipelines_live.items()):
             try:
                 items = p.pull_lost_items_for_api() if hasattr(p, "pull_lost_items_for_api") else []
             except Exception:
@@ -5232,12 +5306,9 @@ def api_lostfound_items(request: Request):
 
                 norm = _apply_override(norm, overrides)
 
-                # skip broken/ghost event items
                 if _should_skip_lf_event_item(norm):
                     continue
 
-                # skip deleted item immediately for Events page,
-                # but DO NOT remove from store
                 if norm.get("deleted") is True:
                     continue
 
@@ -5295,12 +5366,9 @@ def api_lostfound_items(request: Request):
 
                     norm = _apply_override(norm, overrides)
 
-                    # skip broken/ghost event items
                     if _should_skip_lf_event_item(norm):
                         continue
 
-                    # skip deleted item immediately for Events page,
-                    # but DO NOT remove from store
                     if norm.get("deleted") is True:
                         continue
 
@@ -5359,12 +5427,9 @@ def api_lostfound_items(request: Request):
 
                 norm = _apply_override(norm, overrides)
 
-                # skip broken/ghost event items
                 if _should_skip_lf_event_item(norm):
                     continue
 
-                # skip deleted item immediately for Events page,
-                # but DO NOT remove from store
                 if norm.get("deleted") is True:
                     continue
 
@@ -5373,11 +5438,10 @@ def api_lostfound_items(request: Request):
     except Exception:
         pass
 
-    # persist updated store back to disk
-    try:
-        _write_items_store(store)
-    except Exception:
-        pass
+    # IMPORTANT: reload latest store after all merges
+    store = _read_items_store()
+    if not isinstance(store, dict):
+        store = {}
 
     # -------------------------
     # 3) Build response from STORE (history)
@@ -5389,17 +5453,15 @@ def api_lostfound_items(request: Request):
             continue
 
         item = dict(it)
-        item["id"] = str(iid).strip()
+        item["id"] = str(item.get("id") or iid).strip()
         if not item["id"]:
             continue
 
         item = _apply_override(item, overrides)
 
-        # hide deleted items from Events page
         if item.get("deleted") is True:
             continue
 
-        # hide broken/ghost event items from Events page
         if _should_skip_lf_event_item(item):
             continue
 
