@@ -3807,8 +3807,8 @@ class LostAndFoundManager:
         self.id_gen = ScalableIDGenerator(venue_name=self.venue_code, config_path=LOSTFOUND_BACKEND_DIR/"config.json")
         self.snapshot_dedupe_enabled = True
         self.snapshot_dedupe_every = 60.0
-        self.snapshot_similarity_threshold = 0.92
-        self.snapshot_time_window_sec = 600.0  # 10 minutes
+        self.snapshot_similarity_threshold = 0.96
+        self.snapshot_time_window_sec = 120.0 
         self._last_snapshot_dedupe_ts = 0.0
         self.owner_lock_px = float(owner_lock_px)
         self.owner_lock_seconds = float(owner_lock_seconds)
@@ -4121,11 +4121,9 @@ class LostAndFoundManager:
         Snapshot dedupe:
         - compare only same class/view/roi/owner
         - compare only within time window
-        - keep better image
+        - keep better record + better image
         - delete duplicate physical image files
-        - DO NOT merge different lost records into same image_path
-        - DO NOT set image_path to None
-        - record stays, only duplicate file is removed
+        - delete duplicate lost_item record from self.lost_items
         """
         if not self.snapshot_dedupe_enabled:
             return False
@@ -4141,11 +4139,15 @@ class LostAndFoundManager:
 
             groups = defaultdict(list)
             for it in items:
-                if not it or not getattr(it, "image_path", None):
+                if not it:
+                    continue
+                if not getattr(it, "image_path", None):
                     continue
                 if not os.path.exists(it.image_path):
                     continue
                 groups[self._snapshot_signature_group(it)].append(it)
+
+            lost_ids_to_delete = set()
 
             for _, group_items in groups.items():
                 if len(group_items) < 2:
@@ -4155,17 +4157,27 @@ class LostAndFoundManager:
                 keepers = []
 
                 for cur in group_items:
-                    cur_path = str(getattr(cur, "image_path", "") or "")
-                    if not cur_path:
+                    cur_lost_id = str(getattr(cur, "lost_id", "") or "").strip()
+                    cur_path = str(getattr(cur, "image_path", "") or "").strip()
+
+                    if not cur_lost_id or not cur_path:
                         continue
                     if not os.path.exists(cur_path):
+                        continue
+                    if cur_lost_id in lost_ids_to_delete:
                         continue
 
                     matched_keeper = None
 
                     for kept in keepers:
-                        kept_path = str(getattr(kept, "image_path", "") or "")
-                        if not kept_path or not os.path.exists(kept_path):
+                        kept_lost_id = str(getattr(kept, "lost_id", "") or "").strip()
+                        kept_path = str(getattr(kept, "image_path", "") or "").strip()
+
+                        if not kept_lost_id or not kept_path:
+                            continue
+                        if kept_lost_id in lost_ids_to_delete:
+                            continue
+                        if not os.path.exists(kept_path):
                             continue
 
                         # only compare near timestamps
@@ -4185,42 +4197,49 @@ class LostAndFoundManager:
                         continue
 
                     cur_score = self._snapshot_quality_score(cur_path)
-                    keep_path = str(getattr(matched_keeper, "image_path", "") or "")
+
+                    keep_lost_id = str(getattr(matched_keeper, "lost_id", "") or "").strip()
+                    keep_path = str(getattr(matched_keeper, "image_path", "") or "").strip()
                     keep_score = self._snapshot_quality_score(keep_path)
 
                     if cur_score > keep_score:
+                        # current one is better -> current stays, old keeper removed
                         old_keep_path = keep_path
+                        old_keep_id = keep_lost_id
 
-                        # keeper switches to better physical image
-                        matched_keeper.image_path = cur_path
-
-                        # delete old keeper physical file
+                        # delete old keeper image
                         if old_keep_path and old_keep_path != cur_path and os.path.exists(old_keep_path):
                             try:
                                 os.remove(old_keep_path)
                             except Exception:
                                 pass
 
-                        # IMPORTANT:
-                        # do NOT modify cur.image_path
-                        # keep current record untouched
+                        # mark old keeper record for deletion
+                        if old_keep_id:
+                            lost_ids_to_delete.add(old_keep_id)
+
+                        # replace keeper in keepers list with current
+                        keepers = [cur if k is matched_keeper else k for k in keepers]
 
                     else:
-                        # current file is worse duplicate -> delete only physical file
+                        # old keeper stays -> delete current image + current record
                         if cur_path != keep_path and os.path.exists(cur_path):
                             try:
                                 os.remove(cur_path)
                             except Exception:
                                 pass
 
-                        # IMPORTANT:
-                        # do NOT set cur.image_path = None
-                        # do NOT redirect cur.image_path to keeper image
-                        # keep record untouched
+                        if cur_lost_id:
+                            lost_ids_to_delete.add(cur_lost_id)
 
                     changed = True
 
+            # remove duplicate records from lost_items
+            for lost_id in lost_ids_to_delete:
+                self.lost_items.pop(lost_id, None)
+
         return changed
+    
     def _dedup_lost_items(self, items: list) -> list:
         """
         Deduplicate lost items ONLY by lost_id.

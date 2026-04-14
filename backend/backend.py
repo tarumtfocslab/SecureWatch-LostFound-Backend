@@ -2710,16 +2710,13 @@ def _convert_and_promote_worker(stem: str, original_path: Path, target_dir: Path
       - UPLOAD_DIR for upload-scan conversions
     """
     try:
-        with _offline_jobs_lock:
-            _wait_file_stable(original_path)
-            _offline_jobs[stem] = {"status": "processing", "error": None, "started_at": time.time()}
+        _wait_file_stable(original_path)
 
         _manifest_upsert(stem, {"status": "processing", "error": None, "h264_ready": False})
 
         promoted = ensure_h264_promoted(stem, original_path, target_dir)
 
-        # Invalidate cache since file changed
-        invalidate_video_type_cache(stem)  # ADD THIS LINE
+        invalidate_video_type_cache(stem)
 
         _manifest_upsert(
             stem,
@@ -2731,10 +2728,6 @@ def _convert_and_promote_worker(stem: str, original_path: Path, target_dir: Path
             },
         )
 
-        with _offline_jobs_lock:
-            _offline_jobs[stem] = {"status": "ready", "error": None, "started_at": time.time()}
-
-        # auto-grid for fisheye only when source is from UPLOAD_DIR
         try:
             if target_dir.resolve() == UPLOAD_DIR.resolve():
                 if detect_video_type_cached(stem, promoted, force_refresh=False) == "fisheye":
@@ -2744,11 +2737,8 @@ def _convert_and_promote_worker(stem: str, original_path: Path, target_dir: Path
 
     except Exception as e:
         _manifest_upsert(stem, {"status": "failed", "error": str(e), "h264_ready": False})
-        with _offline_jobs_lock:
-            _offline_jobs[stem] = {"status": "failed", "error": str(e), "started_at": time.time()}
         _system(f"CONVERT FAIL stem={stem} err={e}")
         traceback.print_exc()
-
 
 def _startup_scan_offline_folder() -> None:
     """
@@ -4359,17 +4349,11 @@ def offline_group_frame(stem: str, group: str):
 def offline_list_videos(request: Request):
     base = str(request.base_url).rstrip("/")
 
-    # ✅ only reconcile when user is actually in offline page
-    if not (focus_alive() and focus_is(page="offline")):
-        # light: no reconcile, just read manifest
-        items = _manifest_all()
-    else:
+    if focus_alive() and focus_is(page="offline"):
         reconcile_manifest_with_offline_folder()
-        items = _manifest_all()
 
     items = _manifest_all()
 
-    # snapshot job status (avoid holding lock too long)
     with _offline_jobs_lock:
         jobs_snapshot = {k: dict(v) for k, v in _offline_jobs.items()}
 
@@ -4378,12 +4362,13 @@ def offline_list_videos(request: Request):
         it["originalUrl"] = f"{base}/offline/{it.get('name')}"
 
         h264_path = OFFLINE_UPLOAD_DIR / f"{stem}_h264.mp4"
-        it["h264_ready"] = bool(h264_path.exists())
+        h264_ready = bool(h264_path.exists())
+        it["h264_ready"] = h264_ready
 
         vtype = "normal"
         views_count = 1
 
-        if it["h264_ready"]:
+        if h264_ready:
             vtype = detect_video_type_cached(stem, h264_path)
             if vtype == "fisheye":
                 views_count = 8
@@ -4391,16 +4376,22 @@ def offline_list_videos(request: Request):
 
         it["is_fisheye"] = (vtype == "fisheye")
         it["views_count"] = views_count
-        it["h264Url"] = f"{base}/offline/{stem}_h264.mp4" if it["h264_ready"] else None
+        it["h264Url"] = f"{base}/offline/{stem}_h264.mp4" if h264_ready else None
 
-        # ✅ analysis status (NEW)
+        # ONLY real analysis job status goes here
         job = jobs_snapshot.get(stem) or {}
-        it["analysis_status"] = job.get("status")  # queued|processing|done|failed|None
-        it["analysis_error"] = job.get("error")
-        it["is_analyzing"] = job.get("status") in ("queued", "processing")
+        job_status = job.get("status")
+
+        if job_status in ("queued", "processing", "done", "failed"):
+            it["analysis_status"] = job_status
+            it["analysis_error"] = job.get("error")
+            it["is_analyzing"] = job_status in ("queued", "processing")
+        else:
+            it["analysis_status"] = None
+            it["analysis_error"] = None
+            it["is_analyzing"] = False
 
     return {"videos": items}
-
 
 # ---------- OFFLINE upload ----------
 @app.post("/api/offline/upload")
@@ -4472,16 +4463,13 @@ def offline_get_roi(stem: str):
 
 @app.post("/api/offline/roi/{stem}")
 def offline_save_roi(stem: str, payload: Dict[str, Any] = Body(...)):
-    """Save offline ROI without creating duplicates"""
+    """
+    Save offline ROI.
+    IMPORTANT:
+    - If frontend clears ROI, backend must overwrite roi_config.json with empty ROI.
+    - Do NOT merge with existing ROI, otherwise cleared ROI will come back.
+    """
     roi_path = _ensure_roi_file("offline", stem)
-
-    # Read existing ROI
-    existing_roi = {}
-    if roi_path.exists():
-        try:
-            existing_roi = json.loads(roi_path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
 
     # Detect video type
     h264_path = OFFLINE_UPLOAD_DIR / f"{stem}_h264.mp4"
@@ -4489,64 +4477,38 @@ def offline_save_roi(stem: str, payload: Dict[str, Any] = Body(...)):
     if h264_path.exists():
         vtype = detect_video_type_cached(stem, h264_path)
 
-    # Normalize new ROI
+    # Normalize incoming payload
     out = _normalize_roi_payload_to_original(stem, payload, mode="offline")
 
+    # Force clean structure by video type
     if vtype == "fisheye":
-        # Merge with existing polygons to prevent loss
-        existing_fisheye = existing_roi.get("fisheye_polygons", {})
-        new_fisheye = out.get("fisheye_polygons", {})
+        cleaned = {}
+        for name in _fisheye_order_names():
+            val = (out.get("fisheye_polygons", {}) or {}).get(name, [])
+            cleaned[name] = val if isinstance(val, list) else []
 
-        merged = {}
-        all_names = _fisheye_order_names()
-
-        for name in all_names:
-            merged[name] = []
-
-            # Add existing polygons
-            if name in existing_fisheye and isinstance(existing_fisheye[name], list):
-                for poly in existing_fisheye[name]:
-                    merged[name].append(poly)
-
-            # Add new polygons (avoid duplicates)
-            if name in new_fisheye and isinstance(new_fisheye[name], list):
-                for poly in new_fisheye[name]:
-                    exists = False
-                    for existing_poly in merged[name]:
-                        if _polygons_equal(poly, existing_poly):
-                            exists = True
-                            break
-                    if not exists:
-                        merged[name].append(poly)
-
-        out["fisheye_polygons"] = merged
-        out["bounding_polygons"] = []
+        out = {
+            "bounding_polygons": [],
+            "fisheye_polygons": cleaned,
+        }
     else:
-        # For normal video, merge bounding polygons
-        existing_bounding = existing_roi.get("bounding_polygons", [])
-        new_bounding = out.get("bounding_polygons", [])
+        out = {
+            "bounding_polygons": out.get("bounding_polygons", []) or [],
+            "fisheye_polygons": {},
+        }
 
-        merged_bounding = list(existing_bounding)
-        for new_poly in new_bounding:
-            exists = False
-            for existing_poly in merged_bounding:
-                if _polygons_equal(new_poly, existing_poly):
-                    exists = True
-                    break
-            if not exists:
-                merged_bounding.append(new_poly)
-
-        out["bounding_polygons"] = merged_bounding
-        out["fisheye_polygons"] = {}
-
-    # Write back
+    # OVERWRITE directly
     roi_path.write_text(json.dumps(out, indent=2), encoding="utf-8")
 
     roi_ready = (not _roi_is_empty(out))
     _manifest_upsert(stem, {"roi_ready": roi_ready})
 
-    return {"ok": True, "id": stem, "roi_ready": roi_ready, "vtype": vtype}
-
+    return {
+        "ok": True,
+        "id": stem,
+        "roi_ready": roi_ready,
+        "vtype": vtype,
+    }
 
 # ---------- OFFLINE analyze (requires ROI not empty) ----------
 @app.post("/api/offline/analyze")
@@ -4599,6 +4561,48 @@ def offline_analyze(payload: Dict[str, Any] = Body(...)):
     return {"ok": True, "started": False, "status": "queued", "detail": "h264 not ready; analysis queued"}
 
 
+def _safe_unlink_with_retry(path: Path, retries: int = 8, delay: float = 0.4) -> None:
+    if not path.exists():
+        return
+
+    last_err = None
+    for _ in range(retries):
+        try:
+            path.unlink(missing_ok=True)
+            if not path.exists():
+                return
+        except PermissionError as e:
+            last_err = e
+        except OSError as e:
+            last_err = e
+
+        time.sleep(delay)
+
+    if path.exists():
+        raise last_err or PermissionError(f"File still in use: {path}")
+
+
+def _safe_rmtree_with_retry(path: Path, retries: int = 8, delay: float = 0.4) -> None:
+    if not path.exists():
+        return
+
+    last_err = None
+    for _ in range(retries):
+        try:
+            shutil.rmtree(path)
+            if not path.exists():
+                return
+        except PermissionError as e:
+            last_err = e
+        except OSError as e:
+            last_err = e
+
+        time.sleep(delay)
+
+    if path.exists():
+        raise last_err or PermissionError(f"Folder still in use: {path}")
+
+
 @app.delete("/api/offline/video/{stem}")
 def offline_delete_video(stem: str):
     stem = (stem or "").strip()
@@ -4608,7 +4612,7 @@ def offline_delete_video(stem: str):
     h264 = OFFLINE_UPLOAD_DIR / f"{stem}_h264.mp4"
     out_dir = _outputs_dir("offline", stem)
 
-    # find original by scanning (since it may not be .mp4)
+    # find original uploaded file (may be mp4/avi/mov/mkv)
     orig_found: Optional[Path] = None
     for f in OFFLINE_UPLOAD_DIR.iterdir():
         if _is_original_upload_file(f) and f.stem == stem:
@@ -4616,35 +4620,79 @@ def offline_delete_video(stem: str):
             break
 
     try:
-        # delete original + h264 + outputs
-        if orig_found and orig_found.exists():
-            orig_found.unlink(missing_ok=True)
-
-        h264.unlink(missing_ok=True)
-
-        if out_dir.exists():
-            shutil.rmtree(out_dir, ignore_errors=True)
-
-        # remove from manifest
-        m = _read_manifest()
-        vids = m.get("videos") or {}
-        vids.pop(stem, None)
-        m["videos"] = vids
-        _write_manifest(m)
-
-        # also clear queued/running flags
+        # -------------------------------------------------
+        # 1) clear queued / running flags
+        # -------------------------------------------------
         with _offline_jobs_lock:
             _offline_jobs.pop(stem, None)
 
         with _analyze_queue_lock:
             _analyze_queued.discard(stem)
 
-        return {"ok": True, "deleted": stem}
+        # -------------------------------------------------
+        # 2) clear cached frame
+        # -------------------------------------------------
+        with _offline_frame_cache_lock:
+            _offline_frame_cache.pop(stem, None)
+
+        # -------------------------------------------------
+        # 3) clear cached fisheye preprocessor
+        # -------------------------------------------------
+        with _offline_pre_lock:
+            rec = _offline_pre_cache.pop(stem, None)
+            try:
+                pre = rec.get("pre") if isinstance(rec, dict) else None
+                if pre is not None and hasattr(pre, "release"):
+                    pre.release()
+            except Exception:
+                pass
+
+        # -------------------------------------------------
+        # 4) invalidate video-type cache
+        # -------------------------------------------------
+        invalidate_video_type_cache(stem)
+
+        # small wait for Windows file handles to release
+        time.sleep(0.3)
+
+        # -------------------------------------------------
+        # 5) delete original uploaded file
+        # -------------------------------------------------
+        if orig_found and orig_found.exists():
+            _safe_unlink_with_retry(orig_found)
+
+        # -------------------------------------------------
+        # 6) delete promoted h264 file
+        # -------------------------------------------------
+        if h264.exists():
+            _safe_unlink_with_retry(h264)
+
+        # -------------------------------------------------
+        # 7) delete offline output folder
+        # -------------------------------------------------
+        if out_dir.exists():
+            _safe_rmtree_with_retry(out_dir)
+
+        # -------------------------------------------------
+        # 8) remove from manifest
+        # -------------------------------------------------
+        m = _read_manifest()
+        vids = m.get("videos") or {}
+        vids.pop(stem, None)
+        m["videos"] = vids
+        _write_manifest(m)
+
+        return {
+            "ok": True,
+            "deleted": stem,
+            "deleted_original": bool(orig_found),
+            "deleted_h264": True,
+            "deleted_output_dir": True,
+        }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
+        raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+    
 # ============================================================
 # Event Page Processing
 # ============================================================
