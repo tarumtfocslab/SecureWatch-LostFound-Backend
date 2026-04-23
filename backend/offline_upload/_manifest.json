@@ -44,17 +44,6 @@
       "status": "ready",
       "error": null,
       "duration": "00:09:54"
-    },
-    "B001HALL_B_Block_B_Block_20251110100959_20251110105959_18578231_h264": {
-      "name": "B001HALL_B_Block_B_Block_20251110100959_20251110105959_18578231_h264.mp4",
-      "size": "253 MB",
-      "uploadDate": 1776163454,
-      "status": "ready",
-      "h264_ready": true,
-      "h264_name": "B001HALL_B_Block_B_Block_20251110100959_20251110105959_18578231_h264_h264.mp4",
-      "roi_ready": false,
-      "error": null,
-      "duration": "00:49:59"
     }
   }
 }

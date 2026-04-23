@@ -566,12 +566,7 @@ class TrackingThreadROIMatchLF(lf.TrackingThread):
         
 class RealtimeFreshRTSPReaderThread(threading.Thread):
     """
-    RTSP reader tuned to behave closer to Attire:
-    - small internal RTSP buffer
-    - one-frame-per-loop pacing
-    - no aggressive catch-up / no skip-seconds logic
-    - reconnect on failure
-    - keeps Lost & Found downstream pipeline unchanged
+    RTSP reader with stable 2-3 second delay - NO output until buffer is FULLY loaded
     """
 
     def __init__(
@@ -585,6 +580,7 @@ class RealtimeFreshRTSPReaderThread(threading.Thread):
         reconnect_backoff_sec: float = 0.5,
         max_reconnect_backoff_sec: float = 5.0,
         queue_put_fn=None,
+        buffer_delay_sec: float = 2.5,
     ):
         super().__init__(daemon=True)
         self.preprocessor = preprocessor
@@ -602,7 +598,47 @@ class RealtimeFreshRTSPReaderThread(threading.Thread):
 
         self.queue_put_fn = queue_put_fn or lf.put_drop_oldest
         self._reconnect_wait = self.reconnect_backoff_sec
-        self.frame_skip = 0
+        
+        # Buffer delay configuration
+        self.buffer_delay_sec = float(buffer_delay_sec)
+        
+        # Required by lostandfound.py supervisor
+        self._frame_skip = 0
+        
+        # Initialize timing attributes
+        self.frame_timestamp_count = 0
+        self.first_output_time = None
+        
+        # Frame buffer - will only output when FULLY loaded
+        self.frame_buffer = []
+        # Need enough frames to cover the full delay
+        self.required_buffer_frames = int(self.target_fps * self.buffer_delay_sec) + 5
+        self.max_buffer_size = self.required_buffer_frames * 2
+        self.buffer_ready = False  # Only becomes True when buffer is FULLY loaded
+        
+        # Reconnection tracking
+        self.reconnecting = False
+        
+        # Lock for thread-safe buffer access
+        self.buffer_lock = threading.Lock()
+        
+        # Rate limiting
+        self.last_output_time = 0
+        self.min_output_interval = self.frame_period * 0.98
+        
+        # Statistics
+        self.frames_read = 0
+        self.frames_output = 0
+        
+        print(f"[RTSP] Config: {self.buffer_delay_sec}s delay = {self.required_buffer_frames} frames at {self.target_fps}fps")
+
+    @property
+    def frame_skip(self):
+        return self._frame_skip
+
+    @frame_skip.setter
+    def frame_skip(self, value):
+        self._frame_skip = max(0, int(value))
 
     def _get_cap(self):
         return getattr(self.preprocessor, "cap", None)
@@ -625,7 +661,31 @@ class RealtimeFreshRTSPReaderThread(threading.Thread):
             except Exception:
                 break
 
+    def _reset_buffer(self, reason=""):
+        """Completely reset buffer - NO output until fully reloaded"""
+        with self.buffer_lock:
+            self.frame_buffer.clear()
+            self.buffer_ready = False
+            self.first_output_time = None
+            self.frame_timestamp_count = 0
+            self.last_output_time = 0
+            
+            # Clear output queue completely
+            try:
+                while self.out_queue.qsize() > 0:
+                    self.out_queue.get_nowait()
+            except Exception:
+                pass
+            
+            print(f"[RTSP] BUFFER RESET for '{reason}' - need {self.required_buffer_frames} frames before output")
+
     def _safe_reconnect(self) -> bool:
+        if self.reconnecting:
+            return False
+            
+        self.reconnecting = True
+        print("[RTSP] Attempting reconnection...")
+        
         try:
             if hasattr(self.preprocessor, "release"):
                 self.preprocessor.release()
@@ -649,45 +709,58 @@ class RealtimeFreshRTSPReaderThread(threading.Thread):
             except Exception:
                 ok = False
 
-        if not ok:
-            return False
-
-        cap = self._get_cap()
-        self._apply_low_buffer(cap)
-        self._warmup_cap(cap)
-
-        self._reconnect_wait = self.reconnect_backoff_sec
-        return True
+        if ok:
+            cap = self._get_cap()
+            self._apply_low_buffer(cap)
+            self._warmup_cap(cap)
+            self._reconnect_wait = self.reconnect_backoff_sec
+            
+            # CRITICAL: Reset buffer on reconnect
+            self._reset_buffer("reconnection")
+            print("[RTSP] Reconnection successful")
+        else:
+            print("[RTSP] Reconnection failed")
+            
+        self.reconnecting = False
+        return ok
 
     def run(self):
-        # initialize first schedule anchor
-        self._next_due = time.time()
-
-        # apply low-buffer once at start
+        # Initialize with buffer building mode - NO OUTPUT YET
+        self._reset_buffer("initial start")
+        
+        # Apply low-buffer once at start
         try:
             self._apply_low_buffer(self._get_cap())
         except Exception:
             pass
 
+        last_frame_read_time = time.time()
+        
+        print(f"[RTSP] Reader started - Filling buffer with {self.required_buffer_frames} frames before output...")
+        
         while not self.stop_event.is_set():
             try:
-                # wait until next frame time
-                now = time.time()
-                wait_s = self._next_due - now
-                if wait_s > 0:
-                    time.sleep(wait_s)
-
+                current_time = time.time()
+                
+                # === READING PHASE - Read frames as fast as reasonable ===
+                # Don't read too fast - max 2x target FPS
+                read_interval = 1.0 / min(self.target_fps * 2, 30)
+                time_since_last_read = current_time - last_frame_read_time
+                if time_since_last_read < read_interval:
+                    time.sleep(read_interval - time_since_last_read)
+                    current_time = time.time()
+                
                 cap = self._get_cap()
                 if cap is None:
                     if not self._safe_reconnect():
+                        time.sleep(0.1)
                         continue
                     cap = self._get_cap()
                     if cap is None:
-                        time.sleep(0.05)
-                        self._next_due = time.time() + self.frame_period
+                        time.sleep(0.1)
                         continue
 
-                # keep this 0 unless you really need tiny freshness correction
+                # Optional flush grabs
                 for _ in range(self.flush_grabs_per_cycle):
                     try:
                         if not cap.grab():
@@ -695,39 +768,113 @@ class RealtimeFreshRTSPReaderThread(threading.Thread):
                     except Exception:
                         break
 
+                # Read frame
                 ok, frame = cap.read()
+                last_frame_read_time = time.time()
+                
                 if not ok or frame is None:
                     if not self._safe_reconnect():
+                        time.sleep(0.1)
                         continue
-                    self._next_due = time.time() + self.frame_period
                     continue
 
-                ts = time.time()
+                self.frames_read += 1
+                
+                # Store frame in buffer with timestamp
+                with self.buffer_lock:
+                    self.frame_buffer.append((last_frame_read_time, frame.copy()))
+                    
+                    # Limit buffer size
+                    while len(self.frame_buffer) > self.max_buffer_size:
+                        self.frame_buffer.pop(0)
+                    
+                    # CRITICAL: Check if buffer is FULLY loaded (not just partially)
+                    if not self.buffer_ready and len(self.frame_buffer) >= self.required_buffer_frames:
+                        # Also verify the time difference
+                        if len(self.frame_buffer) >= 2:
+                            time_diff = self.frame_buffer[-1][0] - self.frame_buffer[0][0]
+                            if time_diff >= self.buffer_delay_sec:
+                                self.buffer_ready = True
+                                self.first_output_time = time.time()
+                                print(f"[RTSP] ✓ BUFFER READY! {len(self.frame_buffer)} frames, {time_diff:.2f}s delay")
+                                print(f"[RTSP] Starting output at {self.target_fps}fps with {self.buffer_delay_sec}s delay")
+                
+                # === OUTPUT PHASE - ONLY if buffer is FULLY ready ===
+                if self.buffer_ready:
+                    # Strict rate limiting - never output faster than target FPS
+                    time_since_last_output = time.time() - self.last_output_time
+                    if time_since_last_output < self.min_output_interval:
+                        # Wait to maintain correct FPS
+                        sleep_time = self.min_output_interval - time_since_last_output
+                        if sleep_time > 0:
+                            time.sleep(sleep_time)
+                    
+                    # Get the next frame to output
+                    frame_to_output = None
+                    with self.buffer_lock:
+                        if self.frame_buffer:
+                            # Always output the oldest frame first (FIFO)
+                            frame_to_output = self.frame_buffer.pop(0)[1]
+                    
+                    if frame_to_output is not None:
+                        # Clear output queue if it's getting too full
+                        try:
+                            while self.out_queue.qsize() >= 2:
+                                self.out_queue.get_nowait()
+                        except Exception:
+                            pass
+                        
+                        # Output the frame
+                        output_time = time.time()
+                        self.queue_put_fn(self.out_queue, (output_time, None, frame_to_output))
+                        
+                        self.frames_output += 1
+                        self.last_output_time = output_time
+                        
+                        # Periodic stats
+                        if self.frames_output % 30 == 0:
+                            with self.buffer_lock:
+                                buffer_size = len(self.frame_buffer)
+                                print(f"[RTSP] Output: {self.frames_output} frames, buffer: {buffer_size}, target FPS: {self.target_fps}")
+                    else:
+                        # This shouldn't happen if buffer_ready is True
+                        time.sleep(0.001)
+                else:
+                    # Buffer not ready yet - show progress
+                    if self.frames_read % 30 == 0:
+                        with self.buffer_lock:
+                            buffer_size = len(self.frame_buffer)
+                            if buffer_size > 0 and len(self.frame_buffer) >= 2:
+                                time_diff = self.frame_buffer[-1][0] - self.frame_buffer[0][0]
+                                print(f"[RTSP] Loading buffer: {buffer_size}/{self.required_buffer_frames} frames, {time_diff:.1f}/{self.buffer_delay_sec}s")
+                    time.sleep(0.01)
+                
+            except Exception as e:
+                print(f"[ERROR] RTSP reader: {e}")
+                import traceback
+                traceback.print_exc()
+                time.sleep(0.1)
 
-                # prevent queue backlog from building
-                try:
-                    while self.out_queue.qsize() >= 1:
-                        self.out_queue.get_nowait()
-                except Exception:
-                    pass
-
-                self.queue_put_fn(self.out_queue, (ts, None, frame))
-
-                # IMPORTANT:
-                # reset next due from real wall-clock time
-                # do NOT accumulate with +=
-                self._next_due = time.time() + self.frame_period
-
-            except Exception:
-                time.sleep(0.05)
-                self._next_due = time.time() + self.frame_period
-
+        # Send sentinel on exit
         try:
             self.queue_put_fn(self.out_queue, (lf.SENTINEL,))
         except Exception:
             pass
-            
+        
+        print(f"[RTSP] Reader stopped - Read: {self.frames_read}, Output: {self.frames_output}")
 
+    def get_buffer_status(self):
+        """Return current buffer status for debugging"""
+        with self.buffer_lock:
+            return {
+                'buffer_ready': self.buffer_ready,
+                'buffer_size': len(self.frame_buffer),
+                'required_frames': self.required_buffer_frames,
+                'target_delay': self.buffer_delay_sec,
+                'frames_output': self.frames_output,
+                'frames_read': self.frames_read
+            }
+        
 @dataclass
 class PipelineConfig:
     camera_id: str
@@ -737,9 +884,9 @@ class PipelineConfig:
     num_workers: int = 1
     max_skip: float = 2
 
-    desired_fps_fisheye: float = 0.5
+    desired_fps_fisheye: float = 1.0
     desired_fps_normal: float = 1.0
-    display_fps: float = 8.0
+    display_fps: float = 2.5
 
     show_ui: bool = True
     enable_detection: bool = True
@@ -2003,8 +2150,9 @@ class VideoPipeline:
                         self.raw_frame_queue,
                         self.stop_event,
                         target_fps=self.cfg.display_fps,
-                        warmup_grabs=2.3,
-                        flush_grabs_per_cycle=0.9,
+                        warmup_grabs=0,
+                        flush_grabs_per_cycle=0,
+                        buffer_delay_sec=0.5,  # ADD THIS: 2.5 second delay
                     )
                 else:
                     self.reader_thread = lf.FrameReaderThread(
@@ -2055,8 +2203,9 @@ class VideoPipeline:
                         self.frame_queue,
                         self.stop_event,
                         target_fps=self.cfg.display_fps,
-                        warmup_grabs=2.3,
-                        flush_grabs_per_cycle=0.9,
+                        warmup_grabs=0,
+                        flush_grabs_per_cycle=0,
+                        buffer_delay_sec=0.5, 
                     )
                 else:
                     self.reader_thread = lf.FrameReaderThread(

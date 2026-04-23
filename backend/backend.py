@@ -1960,11 +1960,11 @@ def restart_single_live_camera(cam_id: str) -> bool:
                 num_workers=1,
                 max_skip=0.8,
 
-                desired_fps_fisheye=0.5,
+                desired_fps_fisheye=1.0,
                 desired_fps_normal=1.0,
 
                 window_scale=0.80,
-                display_fps=8.0,
+                display_fps=2.5,
                 show_ui=False,
                 enable_detection=detection_enabled,
                 force_video_type=forced_video_type,
@@ -2323,11 +2323,11 @@ def start_live_pipelines(limit_normal: int = 999, limit_fisheye: int = 999):
                 num_workers=1,
                 max_skip=0.8,
 
-                desired_fps_fisheye=0.5,
+                desired_fps_fisheye=1.0,
                 desired_fps_normal=1.0,
 
                 window_scale=0.80,
-                display_fps=8.0,
+                display_fps=2.5,
                 show_ui=False,
                 enable_detection=True,
                 force_video_type=rec["video_type"],
